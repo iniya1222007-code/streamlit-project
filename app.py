@@ -4,20 +4,25 @@ import time
 import json
 import os
 import requests
+from datetime import datetime
 
+# --- CONFIGURATION ---
 st.set_page_config(
     page_title="G-Trace: AI Emergency Rescue",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-DATA_FILE = "accident_status.json"
+# Use /tmp/ for cloud deployment compatibility
+DATA_FILE = "/tmp/accident_status.json"
 FLASK_URL = "http://localhost:5000/status"
 
-@st.cache_data(ttl=2)
+# --- HELPER FUNCTIONS ---
 def get_hardware_data():
+    """Tries to get real data from Flask, then local file, otherwise returns None."""
     try:
-        response = requests.get(FLASK_URL, timeout=5)
+        # This will only work if your Flask server is running on the same machine
+        response = requests.get(FLASK_URL, timeout=1)
         return response.json() if response.status_code == 200 else None
     except:
         if os.path.exists(DATA_FILE):
@@ -31,33 +36,36 @@ def get_hardware_data():
 def calculate_eta(distance_km, amb_speed=60):
     return round((distance_km / max(amb_speed, 1)) * 60, 1)
 
+# --- STYLING ---
 st.markdown("""
 <style>
-.reportview-container { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-.stMetric { background-color: rgba(255,255,255,0.9); padding: 15px; border-radius: 15px; border: 2px solid #ddd; }
-.metric-container { background-color: rgba(255,255,255,0.95); padding: 20px; border-radius: 20px; }
+.stMetric { background-color: rgba(255,255,255,0.1); padding: 15px; border-radius: 15px; border: 1px solid #444; }
 </style>
 """, unsafe_allow_html=True)
 
-
+# --- SIDEBAR CONTROL PANEL ---
 st.sidebar.header("📡 Control Panel")
-test_g_force = st.sidebar.slider("Test G-Force", 0.0, 15.0, 3.5)
+test_g_force = st.sidebar.slider("Test G-Force (Simulate Impact)", 0.0, 15.0, 3.5)
 amb_speed = st.sidebar.slider("Ambulance Speed (km/h)", 20, 120, 60)
 
 if st.sidebar.button("🔄 Reset System"):
-    try:
-        requests.post("http://localhost:5000/reset")
-        st.sidebar.success("Reset successful!")
-        time.sleep(1)
-        st.rerun()
-    except:
-        st.sidebar.error("Flask server not running!")
+    # If on local, try to reset Flask. If on cloud, just clear session.
+    st.session_state.clear()
+    st.sidebar.success("System Reset!")
+    time.sleep(1)
+    st.rerun()
 
-
+# --- DATA PROCESSING ---
 hw_data = get_hardware_data()
-accident_detected = hw_data.get("accident_detected", False) if hw_data else (test_g_force >= 10.0)
-current_g = hw_data.get("g_force", test_g_force) if hw_data else test_g_force
 
+# Logic: If slider is high OR hardware says accident, trigger emergency mode
+is_test_accident = test_g_force >= 10.0
+is_hw_accident = hw_data.get("accident_detected", False) if hw_data else False
+accident_detected = is_test_accident or is_hw_accident
+
+current_g = hw_data.get("g_force", test_g_force) if (hw_data and not is_test_accident) else test_g_force
+
+# --- UI LAYOUT ---
 if not accident_detected:
     st.success("✅ SYSTEM STATUS: ALL SYSTEMS NORMAL")
     st.title("🚗 G-Trace: Real-Time Vehicle Monitoring")
@@ -68,79 +76,69 @@ if not accident_detected:
     with col2:
         st.metric("Status", "Monitoring", "Active")
     
+    # Default map view (Coimbatore) if no GPS
+    default_lat, default_lon = 11.0168, 76.9558
+    p_lat = hw_data.get("lat", default_lat) if hw_data else default_lat
+    p_lon = hw_data.get("lon", default_lon) if hw_data else default_lon
     
-    if hw_data and hw_data.get("lat") and hw_data.get("lon"):
-        df = pd.DataFrame({"lat": [hw_data["lat"]], "lon": [hw_data["lon"]]})
-        st.map(df, zoom=13)
-    else:
-        st.info("📍 Waiting for GPS signal...")
+    df = pd.DataFrame({"lat": [p_lat], "lon": [p_lon]})
+    st.map(df, zoom=13)
+    st.info("📍 System standing by. Increase 'Test G-Force' to 10.0+ to simulate an accident.")
 
 else:
     st.error("🚨 CRITICAL ACCIDENT DETECTED!")
     st.title("🚑 G-Trace: Emergency Response Active")
-    
+
+    # If it's a test/simulated accident, we create fake hospital data
+    if is_test_accident and not is_hw_accident:
+        display_data = {
+            "lat": 11.0830, "lon": 77.0210, # Near KiTE
+            "nearest_hospital": "KMCH Hospital",
+            "nearest_hospital_lat": 11.0500, "nearest_hospital_lon": 77.0400,
+            "distance_km": 4.2,
+            "all_hospitals": ["PSG Hospitals (5.1 km)", "Ganga Hospital (8.4 km)"],
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "gps_valid": True
+        }
+    else:
+        display_data = hw_data
 
     col1, col2 = st.columns([3, 1])
     
     with col1:
         st.subheader("🗺️ Live Rescue Map")
-        
-        map_data = {
-            "lat": [],
-            "lon": [],
-            "name": []
-        }
-        
-    
-        if hw_data:
-            map_data["lat"].extend([hw_data["lat"]])
-            map_data["lon"].extend([hw_data["lon"]])
-            map_data["name"].extend(["🚨 Accident"])
+        map_points = []
+        if display_data:
+            map_points.append({"lat": display_data["lat"], "lon": display_data["lon"], "name": "Accident"})
+            if display_data.get("nearest_hospital_lat"):
+                map_points.append({"lat": display_data["nearest_hospital_lat"], "lon": display_data["nearest_hospital_lon"], "name": "Hospital"})
             
-            # Hospital location
-            if hw_data.get("nearest_hospital_lat"):
-                map_data["lat"].extend([hw_data["nearest_hospital_lat"]])
-                map_data["lon"].extend([hw_data["nearest_hospital_lon"]])
-                map_data["name"].extend(["🏥 Hospital"])
-        
-        if map_data["lat"]:
-            df_map = pd.DataFrame(map_data)
-            st.map(df_map, zoom=13)
+            st.map(pd.DataFrame(map_points), zoom=12)
         
         st.divider()
         st.subheader("📋 Hospital Information")
-        if hw_data:
+        if display_data:
             col_a, col_b, col_c = st.columns(3)
             with col_a:
-                st.metric("Nearest Hospital", 
-                         hw_data.get("nearest_hospital", "N/A"))
+                st.metric("Nearest Hospital", display_data.get("nearest_hospital", "N/A"))
             with col_b:
-                st.metric("Distance", 
-                         f"{hw_data.get('distance_km', 0):.1f} km")
+                st.metric("Distance", f"{display_data.get('distance_km', 0):.1f} km")
             with col_c:
-                eta = calculate_eta(hw_data.get('distance_km', 0), amb_speed)
+                eta = calculate_eta(display_data.get('distance_km', 0), amb_speed)
                 st.metric("ETA", f"{eta} mins")
-            
-            if hw_data.get("all_hospitals"):
-                st.write("**Other Hospitals:**")
-                for hospital in hw_data["all_hospitals"][:3]:
-                    st.write(f"• {hospital}")
     
     with col2:
         st.subheader("📢 Emergency Timeline")
-        with st.status("🚨 EMERGENCY RESPONSE", expanded=True):
-            st.write("✅ High-G impact verified")
-            st.write("✅ GPS location captured")
-            st.write("✅ Nearest hospital located")
-            st.write("✅ 108 ambulance dispatched")
-            st.write("✅ Traffic signals overridden")
+        with st.status("🚨 RESCUE IN PROGRESS", expanded=True):
+            st.write("✅ Impact verified:", f"{current_g}g")
+            st.write("✅ Nearest hospital alerted")
+            st.write("✅ Dispatching ambulance")
+            st.write("⏳ Traffic signal priority: ACTIVE")
         
         st.divider()
-        st.subheader("📡 Hardware Status")
+        st.subheader("📡 Status")
         st.metric("Impact Force", f"{current_g:.2f}g")
-        st.metric("GPS", "Valid" if hw_data.get("gps_valid") else "Searching")
-        st.write(f"**Time:** {hw_data.get('timestamp', 'N/A')}")
-
+        st.write(f"**Time:** {display_data.get('timestamp', 'N/A')}")
 
 st.divider()
-st.caption("👨‍💻 G-Trace Emergency System | Coimbatore, Tamil Nadu")
+st.caption("👨‍💻 G-Trace AI Emergency System | PyExpo 2026")
