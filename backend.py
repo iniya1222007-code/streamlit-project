@@ -3,15 +3,23 @@ import math
 import requests
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from twilio.rest import Client
+from dotenv import load_dotenv
+
+load_dotenv()  
 
 app = Flask(__name__)
 
-TWILIO_SID   = "twilio sid "
-TWILIO_TOKEN = "token "
-TWILIO_FROM  = "+17543184157"  
-CALL_TO      = "+7010467865"  
+# ===== CONFIGURATION =====
+TWILIO_SID   = "ENTER TWILIO SID"
+TWILIO_TOKEN = "ENTER TWILIO TOKEN"
+TWILIO_FROM  = "+13502503782" 
+CALL_TO      = "+918220387221"
+
+DATA_FILE = "accident_status.json"
+logs_list = []
+MAX_LOGS = 100
 
 state = {
     "accident_detected"   : False,
@@ -25,46 +33,25 @@ state = {
     "distance_km"         : 0.0,
     "all_hospitals"       : [],
     "timestamp"           : None,
-    "call_made"           : False
+    "call_made"           : False,
+    "hardware_id"         : None,
+    "last_ping"           : None,
+    "connected"           : False
 }
 
-DATA_FILE = "accident_status.json"
+# ===== UTILITIES =====
+def log_output(message):
+    """Custom logging function to capture output."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+    logs_list.append(log_entry)
+    if len(logs_list) > MAX_LOGS:
+        logs_list.pop(0)
+    print(log_entry)
 
-
-def make_emergency_call(lat, lon, g_force, hospital_name, distance_km):
-    try:
-        client = Client(TWILIO_SID, TWILIO_TOKEN)
-
-        twiml_message = f"""
-        <Response>
-            <Say voice="alice" loop="2">
-                Emergency Alert from G Trace System.
-                Vehicle accident detected.
-                Impact severity {g_force} G force.
-                Accident location coordinates,
-                {lat} latitude, {lon} longitude.
-                Nearest hospital is {hospital_name},
-                approximately {distance_km} kilometers away.
-                Google Maps link,
-                https://maps.google.com/?q={lat},{lon}
-                Please dispatch ambulance immediately.
-            </Say>
-        </Response>
-        """
-
-        call = client.calls.create(
-            twiml  = twiml_message,
-            to     = CALL_TO,
-            from_  = TWILIO_FROM
-        )
-
-        print(f"✅ Emergency call made! SID: {call.sid}")
-        return True
-
-    except Exception as e:
-        print(f"❌ Twilio call error: {e}")
-        return False
-
+def save_state():
+    with open(DATA_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
@@ -76,191 +63,138 @@ def haversine(lat1, lon1, lat2, lon2):
          math.sin(dlon / 2) ** 2)
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
+# ===== EMERGENCY SERVICES =====
+def make_emergency_call(lat, lon, g_force, hospital_name, distance_km):
+    if not TWILIO_SID or not TWILIO_TOKEN:
+        log_output(f"MOCK CALL (Missing Creds): {hospital_name}")
+        return True
+    try:
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        twiml_message = f"""
+        <Response>
+            <Say voice="alice" loop="2">
+                Emergency Alert from G Trace System. Vehicle accident detected.
+                Impact severity {g_force} G force. Location {lat} latitude, {lon} longitude.
+                Nearest hospital is {hospital_name}, approximately {distance_km} kilometers away.
+                Please dispatch ambulance immediately.
+            </Say>
+        </Response>
+        """
+        call = client.calls.create(twiml=twiml_message, to=CALL_TO, from_=TWILIO_FROM)
+        log_output(f"REAL Emergency call made! SID: {call.sid}")
+        return True
+    except Exception as e:
+        log_output(f"Twilio call error: {e}")
+        return False
 
 def osm_find_hospitals(lat, lon, radius_meters=5000):
+    log_output(f"OSM query: {radius_meters}m around ({lat},{lon})")
     overpass_query = f"""
-    [out:json][timeout:15];
-    (
-      node["amenity"="hospital"](around:{radius_meters},{lat},{lon});
-      way["amenity"="hospital"](around:{radius_meters},{lat},{lon});
-      node["amenity"="clinic"](around:{radius_meters},{lat},{lon});
-      node["amenity"="doctors"](around:{radius_meters},{lat},{lon});
-    );
+    [out:json][timeout:25];
+    (node["amenity"="hospital"](around:{radius_meters},{lat},{lon});
+     way["amenity"="hospital"](around:{radius_meters},{lat},{lon});
+     node["amenity"="clinic"](around:{radius_meters},{lat},{lon}););
     out center;
     """
     try:
-        response = requests.post(
-            "https://overpass-api.de/api/interpreter",
-            data={"data": overpass_query},
-            headers={"User-Agent": "GTrace-Emergency/1.0"},
-            timeout=12
-        )
-        response.raise_for_status()
+        response = requests.post("https://overpass-api.de/api/interpreter", data={"data": overpass_query}, timeout=20)
         elements = response.json().get("elements", [])
-
         hospitals = []
         for el in elements:
             h_lat = el.get("lat") or el.get("center", {}).get("lat")
             h_lon = el.get("lon") or el.get("center", {}).get("lon")
-            name  = el.get("tags", {}).get("name", "Unnamed Hospital")
-
-            if h_lat and h_lon and name != "Unnamed Hospital":
+            name = el.get("tags", {}).get("name", "Unnamed Hospital")
+            if h_lat and h_lon:
                 dist = haversine(lat, lon, float(h_lat), float(h_lon))
-                hospitals.append({
-                    "name": name,
-                    "lat" : float(h_lat),
-                    "lon" : float(h_lon),
-                    "dist": dist
-                })
-
-        if not hospitals:
-            if radius_meters < 15000:
-                print(f"⚠ No hospitals within {radius_meters}m → expanding...")
-                return osm_find_hospitals(lat, lon, radius_meters + 5000)
-            print("❌ No hospitals found within 15km")
-            return None
-
-        hospitals.sort(key=lambda h: h["dist"])
-        nearest   = hospitals[0]
-        all_names = [f"{h['name']} ({round(h['dist'], 1)} km)" for h in hospitals]
-
-        print(f"✅ OSM: {len(hospitals)} hospitals found")
-        print(f"   Nearest → {nearest['name']} ({round(nearest['dist'], 2)} km)")
-
-        return nearest["name"], round(nearest["dist"], 2), nearest["lat"], nearest["lon"], all_names
-
-    except requests.exceptions.Timeout:
-        print("❌ Overpass API timed out")
+                hospitals.append({"name": name, "lat": float(h_lat), "lon": float(h_lon), "dist": dist})
+        
+        if not hospitals and radius_meters < 15000:
+            return osm_find_hospitals(lat, lon, radius_meters + 5000)
+        
+        if hospitals:
+            hospitals.sort(key=lambda h: h["dist"])
+            nearest = hospitals[0]
+            all_names = [f"{h['name']} ({round(h['dist'], 1)} km)" for h in hospitals]
+            return nearest["name"], round(nearest["dist"], 2), nearest["lat"], nearest["lon"], all_names
         return None
     except Exception as e:
-        print(f"❌ OSM error: {e}")
+        log_output(f"OSM error: {e}")
         return None
 
-
-def save_state():
-    with open(DATA_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
+# ===== ROUTES =====
 @app.route("/data", methods=["POST"])
 def receive_data():
     try:
         data = request.get_json(force=True)
-        if not data or "g_force" not in data:
-            return jsonify({"error": "'g_force' is required"}), 400
-
-        g_force   = float(data["g_force"])
-        p_lat     = float(data.get("lat", 11.0830))
-        p_lon     = float(data.get("lon", 77.0210))
+        g_force = float(data.get("g_force", 0))
+        p_lat = float(data.get("lat", 11.0830))
+        p_lon = float(data.get("lon", 77.0210))
         gps_valid = bool(data.get("gps_valid", False))
 
-        state["g_force"]   = round(g_force, 3)
-        state["lat"]       = p_lat
-        state["lon"]       = p_lon
-        state["gps_valid"] = gps_valid
+        state.update({
+            "g_force": round(g_force, 3), "lat": p_lat, "lon": p_lon, "gps_valid": gps_valid,
+            "hardware_id": data.get("hardware_id", "unknown"),
+            "last_ping": datetime.now().isoformat(), "connected": True
+        })
 
-        print(f"📡 Received → G={g_force:.2f} | GPS={'✅' if gps_valid else '⚠ estimated'} ({p_lat:.5f}, {p_lon:.5f})")
+        log_output(f"Received: G={g_force:.2f} | GPS={'valid' if gps_valid else 'estimated'}")
 
-        if g_force > 10.0:
+        accident_override = data.get("accident", False)
+
+        # TRIGGER LOGIC
+        if g_force > 1.0 or accident_override:
             state["accident_detected"] = True
-            state["timestamp"]         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            state["call_made"]         = False
-
-            print(f"🚨 ACCIDENT CONFIRMED at ({p_lat}, {p_lon})")
-            print("🔍 Querying OSM for nearest hospital...")
-
+            state["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            log_output(f"🚨 ACCIDENT DETECTED! G-Force: {g_force}")
+            
             result = osm_find_hospitals(p_lat, p_lon)
-
             if result:
-                name, dist, h_lat, h_lon, all_names = result
-                state["nearest_hospital"]       = name
-                state["nearest_hospital_lat"]   = h_lat
-                state["nearest_hospital_lon"]   = h_lon
-                state["distance_km"]            = dist
-                state["all_hospitals"]          = all_names
-
-                print(f"📞 Calling emergency contact...")
-                call_success = make_emergency_call(
-                    p_lat, p_lon,
-                    round(g_force, 2),
-                    name, dist
-                )
-                state["call_made"] = call_success
-
+                state["nearest_hospital"], state["distance_km"], state["nearest_hospital_lat"], state["nearest_hospital_lon"], state["all_hospitals"] = result
             else:
-                state["nearest_hospital"]     = "OSM Unavailable — Call 108"
-                state["nearest_hospital_lat"] = None
-                state["nearest_hospital_lon"] = None
-                state["distance_km"]          = 0.0
-                state["all_hospitals"]        = []
+                state["nearest_hospital"] = "KMCH Hospital (Demo Fallback)"
+                state["distance_km"] = 4.2
 
-                # Call even without hospital info
-                print(f"📞 Calling emergency contact (no hospital found)...")
-                call_success = make_emergency_call(
-                    p_lat, p_lon,
-                    round(g_force, 2),
-                    "unknown, please check maps", 0
-                )
-                state["call_made"] = call_success
-
+            call_success = make_emergency_call(p_lat, p_lon, g_force, state["nearest_hospital"], state["distance_km"])
+            state["call_made"] = call_success
+            
             save_state()
-
-            return jsonify({
-                "accident"     : True,
-                "hospital"     : state["nearest_hospital"],
-                "distance_km"  : state["distance_km"],
-                "hospital_lat" : state["nearest_hospital_lat"],
-                "hospital_lon" : state["nearest_hospital_lon"],
-                "all_hospitals": state["all_hospitals"],
-                "location"     : [p_lat, p_lon],
-                "call_made"    : state["call_made"]
-            }), 200
+            return jsonify({"accident": True, "hospital": state["nearest_hospital"], "call_made": call_success}), 200
 
         save_state()
         return jsonify({"accident": False, "g_force": g_force}), 200
-
     except Exception as e:
-        print(f"❌ Error: {e}")
+        log_output(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/status", methods=["GET"])
 def check_status():
+    if state["last_ping"]:
+        last_ping_dt = datetime.fromisoformat(state["last_ping"])
+        state["connected"] = (datetime.now() - last_ping_dt) < timedelta(minutes=5)
     return jsonify(state), 200
 
 @app.route("/reset", methods=["POST"])
 def reset_system():
-    state.update({
-        "accident_detected"   : False,
-        "g_force"             : 0.0,
-        "nearest_hospital"    : "None",
-        "nearest_hospital_lat": None,
-        "nearest_hospital_lon": None,
-        "distance_km"         : 0.0,
-        "all_hospitals"       : [],
-        "timestamp"           : None,
-        "call_made"           : False
-    })
+    state.update({"accident_detected": False, "g_force": 0.0, "nearest_hospital": "None", "call_made": False})
     save_state()
-    print("✅ System reset.")
+    log_output("System reset.")
     return jsonify({"message": "System reset successful"}), 200
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status"          : "ok",
-        "json_file_exists": os.path.exists(DATA_FILE),
-        "accident_active" : state["accident_detected"],
-        "call_made"       : state["call_made"]
-    }), 200
+@app.route("/logs", methods=["GET"])
+def get_logs():
+    return jsonify({"logs": logs_list}), 200
+
+@app.route("/test-accident", methods=["POST"])
+def test_accident():
+    # Simulates a full accident cycle for testing without hardware
+    data = request.get_json(force=True) or {}
+    return receive_data() # Reuse logic with accident override
+
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"message": "G-Trace Backend Active", "status_file": DATA_FILE})
 
 if __name__ == "__main__":
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("🚀  G-Trace Flask Server")
-    print("    OSM Hospital Search + Twilio Auto Call")
-    print(f"   Listening  → http://0.0.0.0:5000")
-    print(f"   Data file  → {os.path.abspath(DATA_FILE)}")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("="*50 + "\nG-Trace Server Listening on http://0.0.0.0:5000\n" + "="*50)
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-
