@@ -1,5 +1,7 @@
-streamlit
 flask
 requests
-folium
-streamlit-folium
+twilio
+python-dotenv
+streamlit
+pandas
+gunicorn
