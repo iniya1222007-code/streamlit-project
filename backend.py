@@ -11,10 +11,13 @@ load_dotenv()
 
 app = Flask(__name__)
 
-TWILION_ACC_SID       = "twilio sid"
-TWILION_AUTH_TOKEN    = " twilio token"
-TWILION_PHONE_NUMBER  = +13502503782
-EMERGENCY_CALL_TO     = +918220387221
+# =====================================================
+# TWILIO CONFIG — reads from env / .env file
+# =====================================================
+TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN",  "")
+TWILIO_FROM  = os.getenv("TWILIO_PHONE_NUMBER", "")   # e.g. "+13502503782"
+CALL_TO      = os.getenv("EMERGENCY_CALL_TO",   "")   # e.g. "+918220387221"
 
 DATA_FILE = "accident_status.json"
 logs_list = []
@@ -133,8 +136,8 @@ def osm_find_hospitals(lat, lon, radius_meters=5000):
 # TWILIO EMERGENCY CALL
 # =====================================================
 def make_emergency_call(lat, lon, g_force, hospital_name, distance_km):
-    if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_FROM:
-        log_output(f"[MOCK CALL] No Twilio creds — would call {CALL_TO} for {hospital_name}")
+    if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_FROM or not CALL_TO:
+        log_output(f"[MOCK CALL] No Twilio creds — would call {CALL_TO or 'UNSET'} for {hospital_name}")
         return True
     try:
         client = Client(TWILIO_SID, TWILIO_TOKEN)
@@ -187,7 +190,7 @@ def handle_accident(g_force, p_lat, p_lon, gps_valid, is_test=False):
         state["all_hospitals"]        = []
         log_output("OSM unavailable — using fallback")
 
-    log_output(f"Placing emergency call to {CALL_TO}...")
+    log_output(f"Placing emergency call to {CALL_TO or 'UNSET'}...")
     state["call_made"] = make_emergency_call(
         p_lat, p_lon, g_force,
         state["nearest_hospital"],
@@ -371,7 +374,7 @@ if __name__ == "__main__":
     print("=" * 55)
     print("  G-Trace Emergency Backend")
     print(f"  Twilio : {'Configured' if TWILIO_SID else 'NOT SET — running in mock mode'}")
-    print(f"  Call To: {CALL_TO}")
+    print(f"  Call To: {CALL_TO or 'NOT SET'}")
     print(f"  Data   : {os.path.abspath(DATA_FILE)}")
     print("  URL    : http://0.0.0.0:5000")
     print("=" * 55)
